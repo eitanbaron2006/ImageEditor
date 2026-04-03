@@ -1,0 +1,5 @@
+{
+  "name": "AI Generative Fill Editor",
+  "description": "An application that allows you to draw on images and use AI to change the marked areas based on a text prompt.",
+  "requestFramePermissions": []
+}
