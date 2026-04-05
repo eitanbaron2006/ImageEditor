@@ -5,6 +5,7 @@ import { GoogleGenAI } from "@google/genai";
 import { 
   Upload, 
   Image as ImageIcon, 
+  Images,
   PenTool, 
   Download, 
   Sparkles,
@@ -17,19 +18,34 @@ import {
   MousePointer2,
   Eraser,
   Undo,
-  Redo
+  Redo,
+  X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { useAuth } from '@/components/AuthProvider';
+import { collection, addDoc, serverTimestamp, query, where, orderBy, onSnapshot } from 'firebase/firestore';
+import { ref, uploadString, getDownloadURL } from 'firebase/storage';
+import { db, storage } from '@/lib/firebase';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-const AI_MODEL = "gemini-2.5-flash-image";
+declare global {
+  interface Window {
+    aistudio?: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+  }
+}
+
+const AI_MODEL = "gemini-3.1-flash-image-preview";
 
 export default function CanvasEditor() {
+  const { user } = useAuth();
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -43,6 +59,25 @@ export default function CanvasEditor() {
   const [status, setStatus] = useState<string>('');
   const [isPanelOpen, setIsPanelOpen] = useState(true);
   const [canvasScale, setCanvasScale] = useState(1);
+  const [hasApiKey, setHasApiKey] = useState(true);
+  const [displaySize, setDisplaySize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    const checkKey = async () => {
+      if (window.aistudio?.hasSelectedApiKey) {
+        const hasKey = await window.aistudio.hasSelectedApiKey();
+        setHasApiKey(hasKey);
+      }
+    };
+    checkKey();
+  }, []);
+
+  const handleSelectKey = async () => {
+    if (window.aistudio?.openSelectKey) {
+      await window.aistudio.openSelectKey();
+      setHasApiKey(true);
+    }
+  };
   const [historyState, setHistoryState] = useState<{ past: string[], present: string | null, future: string[] }>({
     past: [],
     present: null,
@@ -53,6 +88,27 @@ export default function CanvasEditor() {
     present: null,
     future: []
   });
+  const [savedEdits, setSavedEdits] = useState<any[]>([]);
+  const [showGallery, setShowGallery] = useState(false);
+
+  useEffect(() => {
+    if (!user) {
+      setSavedEdits([]);
+      return;
+    }
+    const q = query(
+      collection(db, 'edits'),
+      where('userId', '==', user.uid),
+      orderBy('createdAt', 'desc')
+    );
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const edits = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setSavedEdits(edits);
+    }, (error) => {
+      console.error("Error fetching gallery:", error);
+    });
+    return () => unsubscribe();
+  }, [user]);
 
   const saveHistoryState = useCallback(() => {
     const canvas = maskCanvasRef.current;
@@ -124,44 +180,58 @@ export default function CanvasEditor() {
 
     // Use requestAnimationFrame to ensure container dimensions are updated
     requestAnimationFrame(() => {
-      const computedStyle = window.getComputedStyle(container);
-      const paddingX = parseFloat(computedStyle.paddingLeft) + parseFloat(computedStyle.paddingRight);
-      const paddingY = parseFloat(computedStyle.paddingTop) + parseFloat(computedStyle.paddingBottom);
-
-      const availableWidth = container.clientWidth - paddingX;
-      const availableHeight = container.clientHeight - paddingY;
-      
-      if (availableWidth <= 0 || availableHeight <= 0) return;
-
       let width = img.width;
       let height = img.height;
 
-      const scale = Math.min(availableWidth / width, availableHeight / height, 1);
-      
-      width = width * scale;
-      height = height * scale;
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+        maskCanvas.width = width;
+        maskCanvas.height = height;
 
-      canvas.width = width;
-      canvas.height = height;
-      maskCanvas.width = width;
-      maskCanvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+        }
+        
+        const maskCtx = maskCanvas.getContext('2d');
+        if (maskCtx) {
+          maskCtx.lineCap = 'round';
+          maskCtx.lineJoin = 'round';
+        }
+        
+        setHistoryState({
+          past: [],
+          present: maskCanvas.toDataURL(),
+          future: []
+        });
+      }
 
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(img, 0, 0, width, height);
+      // Calculate display size
+      const containerRect = container.getBoundingClientRect();
+      const computedStyle = window.getComputedStyle(container);
+      const pt = parseFloat(computedStyle.paddingTop) || 0;
+      const pb = parseFloat(computedStyle.paddingBottom) || 0;
+      const pl = parseFloat(computedStyle.paddingLeft) || 0;
+      const pr = parseFloat(computedStyle.paddingRight) || 0;
+
+      const availableWidth = containerRect.width - pl - pr;
+      const availableHeight = containerRect.height - pt - pb;
+
+      if (availableWidth <= 0 || availableHeight <= 0) return;
+
+      const containerRatio = availableWidth / availableHeight;
+      const imageRatio = width / height;
+
+      let displayWidth, displayHeight;
+      if (imageRatio > containerRatio) {
+        displayWidth = availableWidth;
+        displayHeight = availableWidth / imageRatio;
+      } else {
+        displayHeight = availableHeight;
+        displayWidth = availableHeight * imageRatio;
       }
-      
-      const maskCtx = maskCanvas.getContext('2d');
-      if (maskCtx) {
-        maskCtx.lineCap = 'round';
-        maskCtx.lineJoin = 'round';
-      }
-      
-      setHistoryState({
-        past: [],
-        present: maskCanvas.toDataURL(),
-        future: []
-      });
+      setDisplaySize({ width: displayWidth, height: displayHeight });
     });
   }, []);
 
@@ -172,6 +242,7 @@ export default function CanvasEditor() {
       const newPast = curr.past.slice(0, curr.past.length - 1);
       
       const img = new Image();
+      img.crossOrigin = "anonymous";
       img.onload = () => {
         setImage(img);
         resizeCanvas(img);
@@ -198,6 +269,7 @@ export default function CanvasEditor() {
       const newFuture = curr.future.slice(1);
       
       const img = new Image();
+      img.crossOrigin = "anonymous";
       img.onload = () => {
         setImage(img);
         resizeCanvas(img);
@@ -235,6 +307,7 @@ export default function CanvasEditor() {
       reader.onload = (event) => {
         const src = event.target?.result as string;
         const img = new Image();
+        img.crossOrigin = "anonymous";
         img.onload = () => {
           setImage(img);
           resizeCanvas(img);
@@ -270,7 +343,11 @@ export default function CanvasEditor() {
 
     ctx.beginPath();
     ctx.moveTo(x, y);
-    ctx.lineWidth = penSize;
+    
+    // Scale pen size based on the ratio between internal resolution and displayed size
+    const scaleRatio = canvas.width / rect.width;
+    ctx.lineWidth = penSize * scaleRatio;
+    
     ctx.strokeStyle = penColor;
     ctx.globalAlpha = 1.0;
     
@@ -326,14 +403,14 @@ export default function CanvasEditor() {
     setIsProcessing(true);
     setStatus('Generating...');
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY! });
+      const ai = new GoogleGenAI({ apiKey: (process.env.API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY)! });
       const response = await ai.models.generateContent({
         model: AI_MODEL,
         contents: { parts: [{ text: `Generate a professional, high-quality image of: ${prompt}` }] },
         config: {
           imageConfig: {
             aspectRatio: "1:1",
-            imageSize: "1K"
+            imageSize: "4K"
           }
         }
       });
@@ -343,12 +420,30 @@ export default function CanvasEditor() {
         const base64 = imagePart.inlineData.data;
         const src = `data:image/png;base64,${base64}`;
         const img = new Image();
-        img.onload = () => {
+        img.crossOrigin = "anonymous";
+        img.onload = async () => {
           setImage(img);
           resizeCanvas(img);
           clearMask();
           setStatus('Ready');
           setImageHistory({ past: [], present: src, future: [] });
+          
+          if (user) {
+            try {
+              const storageRef = ref(storage, `edits/${user.uid}/${Date.now()}.png`);
+              await uploadString(storageRef, base64!, 'base64', { contentType: 'image/png' });
+              const downloadUrl = await getDownloadURL(storageRef);
+              
+              await addDoc(collection(db, 'edits'), {
+                userId: user.uid,
+                imageUrl: downloadUrl,
+                prompt: prompt,
+                createdAt: serverTimestamp()
+              });
+            } catch (error) {
+              console.error("Error saving generated image to storage/database:", error);
+            }
+          }
         };
         img.src = src;
       } else {
@@ -412,7 +507,7 @@ export default function CanvasEditor() {
 
       const maskedBase64 = tempCanvas.toDataURL('image/png').split(',')[1];
 
-      const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY! });
+      const ai = new GoogleGenAI({ apiKey: (process.env.API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY)! });
       
       const ratio = canvas.width / canvas.height;
       const options = [
@@ -449,7 +544,7 @@ IMPORTANT: You must REMOVE the red dashed box in your final generated image. Do 
         config: {
           imageConfig: {
             aspectRatio: closestRatio,
-            imageSize: "1K"
+            imageSize: "4K"
           }
         }
       });
@@ -459,7 +554,8 @@ IMPORTANT: You must REMOVE the red dashed box in your final generated image. Do 
         const base64 = imagePart.inlineData.data;
         const src = `data:image/png;base64,${base64}`;
         const img = new Image();
-        img.onload = () => {
+        img.crossOrigin = "anonymous";
+        img.onload = async () => {
           setImage(img);
           resizeCanvas(img);
           clearMask();
@@ -469,6 +565,23 @@ IMPORTANT: You must REMOVE the red dashed box in your final generated image. Do 
             present: src,
             future: []
           }));
+          
+          if (user) {
+            try {
+              const storageRef = ref(storage, `edits/${user.uid}/${Date.now()}.png`);
+              await uploadString(storageRef, base64!, 'base64', { contentType: 'image/png' });
+              const downloadUrl = await getDownloadURL(storageRef);
+              
+              await addDoc(collection(db, 'edits'), {
+                userId: user.uid,
+                imageUrl: downloadUrl,
+                prompt: prompt || 'Erase object',
+                createdAt: serverTimestamp()
+              });
+            } catch (error) {
+              console.error("Error saving edit to storage/database:", error);
+            }
+          }
         };
         img.src = src;
       } else {
@@ -482,16 +595,37 @@ IMPORTANT: You must REMOVE the red dashed box in your final generated image. Do 
     }
   };
 
-  const downloadImage = () => {
-    if (!canvasRef.current) return;
-    const link = document.createElement('a');
-    link.download = 'ai-edited-image.png';
-    link.href = canvasRef.current.toDataURL();
-    link.click();
+  const downloadImage = async () => {
+    if (!image) return;
+    try {
+      if (image.src.startsWith('data:')) {
+        const link = document.createElement('a');
+        link.download = 'ai-edited-image.png';
+        link.href = image.src;
+        link.click();
+      } else {
+        const response = await fetch(image.src);
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.download = 'ai-edited-image.png';
+        link.href = url;
+        link.click();
+        URL.revokeObjectURL(url);
+      }
+    } catch (error) {
+      console.error("Error downloading image:", error);
+      if (canvasRef.current) {
+        const link = document.createElement('a');
+        link.download = 'ai-edited-image.png';
+        link.href = canvasRef.current.toDataURL();
+        link.click();
+      }
+    }
   };
 
   return (
-    <div className="flex flex-col h-[calc(100dvh-32px)] md:h-[calc(100vh-160px)] w-full max-w-7xl mx-auto overflow-hidden rounded-2xl md:rounded-3xl border border-zinc-800 bg-zinc-900/50 backdrop-blur-xl shadow-2xl relative">
+    <div className="flex flex-col h-full w-full overflow-hidden rounded-none border-none bg-zinc-900/50 relative">
       {/* Top Header / Status Bar */}
       <div className="h-14 border-bottom border-zinc-800 flex items-center justify-between px-6 bg-zinc-950/50">
         <div className="flex items-center gap-4">
@@ -508,6 +642,52 @@ IMPORTANT: You must REMOVE the red dashed box in your final generated image. Do 
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Brush Controls (Desktop) */}
+          {image && !isProcessing && (
+            <div className="hidden lg:flex items-center gap-4 mr-4 pr-4 border-r border-zinc-800">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-mono text-zinc-400">Size</span>
+                <input 
+                  type="range" min="5" max="150" value={penSize} 
+                  onChange={(e) => setPenSize(parseInt(e.target.value))}
+                  className="w-20 h-1 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-mono text-zinc-400">Opacity</span>
+                <input 
+                  type="range" min="0.1" max="1" step="0.05" value={opacity} 
+                  onChange={(e) => setOpacity(parseFloat(e.target.value))}
+                  className="w-20 h-1 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                />
+              </div>
+              <div className="flex items-center gap-1">
+                {['#6366f1', '#ef4444', '#22c55e', '#eab308', '#ec4899'].map(color => (
+                  <button
+                    key={color}
+                    onClick={() => setPenColor(color)}
+                    className={cn(
+                      "w-4 h-4 rounded-full transition-transform",
+                      penColor === color ? "scale-110 ring-2 ring-white/20" : "hover:scale-110"
+                    )}
+                    style={{ backgroundColor: color }}
+                  />
+                ))}
+              </div>
+              <div className="w-[1px] h-4 bg-zinc-800 mx-1" />
+              <button onClick={handleUndo} disabled={historyState.past.length === 0} className="text-zinc-500 hover:text-zinc-300 disabled:opacity-30 transition-colors" title="Undo Mask">
+                <Undo className="w-4 h-4" />
+              </button>
+              <button onClick={handleRedo} disabled={historyState.future.length === 0} className="text-zinc-500 hover:text-zinc-300 disabled:opacity-30 transition-colors" title="Redo Mask">
+                <Redo className="w-4 h-4" />
+              </button>
+              <div className="w-[1px] h-4 bg-zinc-800 mx-1" />
+              <button onClick={clearMask} className="text-zinc-500 hover:text-zinc-300 transition-colors" title="Clear Mask">
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
           {image && (
             <div className="flex items-center bg-zinc-800 rounded-lg p-0.5 border border-zinc-700 mr-1 sm:mr-2">
               <button 
@@ -534,6 +714,15 @@ IMPORTANT: You must REMOVE the red dashed box in your final generated image. Do 
             <span className="hidden sm:inline">Upload</span>
             <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
           </label>
+          {user && (
+            <button 
+              onClick={() => setShowGallery(true)}
+              className="flex items-center gap-2 py-1.5 px-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg transition-all text-xs font-medium border border-zinc-700"
+            >
+              <Images className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Gallery</span>
+            </button>
+          )}
           <button 
             onClick={downloadImage}
             disabled={!image}
@@ -590,12 +779,12 @@ IMPORTANT: You must REMOVE the red dashed box in your final generated image. Do 
         </div>
 
         {/* Main Canvas Area */}
-        <div ref={containerRef} className="flex-1 relative flex items-center justify-center bg-zinc-950 p-4 pt-32 pb-20 md:p-6 md:pt-28 overflow-hidden">
+        <div ref={containerRef} className="flex-1 min-h-0 min-w-0 relative flex items-center justify-center bg-zinc-950 p-4 md:p-6 overflow-hidden">
           <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'radial-gradient(#ffffff 1px, transparent 1px)', backgroundSize: '24px 24px' }} />
           
           {/* Floating Brush Controls (Desktop & Mobile) */}
           {image && !isProcessing && (
-            <div className="absolute top-6 left-1/2 -translate-x-1/2 flex flex-col sm:flex-row items-center gap-4 sm:gap-6 p-4 bg-zinc-900/90 backdrop-blur-xl border border-zinc-800 rounded-2xl shadow-2xl z-[60] w-[90%] sm:w-auto min-w-[300px]">
+            <div className="lg:hidden absolute top-6 left-1/2 -translate-x-1/2 flex flex-col sm:flex-row items-center gap-4 sm:gap-6 p-4 bg-zinc-900/90 backdrop-blur-xl border border-zinc-800 rounded-2xl shadow-2xl z-[60] w-[90%] sm:w-auto min-w-[300px]">
               <div className="flex w-full sm:w-auto gap-4 sm:gap-6">
                 <div className="flex-1 sm:w-32 space-y-2">
                   <div className="flex justify-between text-[10px] font-mono text-zinc-400">
@@ -673,8 +862,14 @@ IMPORTANT: You must REMOVE the red dashed box in your final generated image. Do 
                 </div>
               </motion.div>
             ) : (
-              <div className="relative shadow-2xl shadow-black/50">
-                <canvas ref={canvasRef} className="block rounded-lg" />
+              <div 
+                className="relative shadow-2xl shadow-black/50 rounded-lg"
+                style={{
+                  width: displaySize.width > 0 ? displaySize.width : 'auto',
+                  height: displaySize.height > 0 ? displaySize.height : 'auto',
+                }}
+              >
+                <canvas ref={canvasRef} className="absolute inset-0 w-full h-full block rounded-lg" />
                 <canvas 
                   ref={maskCanvasRef}
                   onMouseDown={startDrawing}
@@ -684,7 +879,7 @@ IMPORTANT: You must REMOVE the red dashed box in your final generated image. Do 
                   onTouchStart={startDrawing}
                   onTouchMove={draw}
                   onTouchEnd={stopDrawing}
-                  className="absolute top-0 left-0 block cursor-crosshair touch-none rounded-lg"
+                  className="absolute inset-0 w-full h-full cursor-crosshair touch-none rounded-lg"
                   style={{ opacity }}
                 />
                 
@@ -803,21 +998,155 @@ IMPORTANT: You must REMOVE the red dashed box in your final generated image. Do 
       </AnimatePresence>
 
       {/* Instructions Overlay (Desktop) */}
-      <div className="hidden lg:block absolute bottom-6 right-6 p-4 bg-zinc-900/50 backdrop-blur-md border border-zinc-800 rounded-2xl max-w-xs pointer-events-none">
-        <div className="flex items-start gap-3">
-          <div className="p-2 bg-indigo-500/10 rounded-lg">
-            <MousePointer2 className="w-4 h-4 text-indigo-400" />
-          </div>
-          <div className="space-y-1">
-            <h5 className="text-xs font-bold text-zinc-200">Quick Guide</h5>
-            <p className="text-[10px] text-zinc-500 leading-relaxed">
-              1. Upload or generate an image.<br/>
-              2. Paint over the area you want to change.<br/>
-              3. Describe the new content and apply fill.
-            </p>
+      {!image && !isProcessing && (
+        <div className="hidden lg:block absolute bottom-6 right-6 p-4 bg-zinc-900/50 backdrop-blur-md border border-zinc-800 rounded-2xl max-w-xs pointer-events-none">
+          <div className="flex items-start gap-3">
+            <div className="p-2 bg-indigo-500/10 rounded-lg">
+              <MousePointer2 className="w-4 h-4 text-indigo-400" />
+            </div>
+            <div className="space-y-1">
+              <h5 className="text-xs font-bold text-zinc-200">Quick Guide</h5>
+              <p className="text-[10px] text-zinc-500 leading-relaxed">
+                1. Upload or generate an image.<br/>
+                2. Paint over the area you want to change.<br/>
+                3. Describe the new content and apply fill.
+              </p>
+            </div>
           </div>
         </div>
-      </div>
+      )}
+
+      {/* Gallery Modal */}
+      <AnimatePresence>
+        {showGallery && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-zinc-950/80 backdrop-blur-sm"
+          >
+            <motion.div 
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-zinc-900 border border-zinc-800 rounded-3xl w-full max-w-4xl max-h-[85vh] flex flex-col overflow-hidden shadow-2xl"
+            >
+              <div className="flex items-center justify-between p-6 border-b border-zinc-800">
+                <h2 className="text-xl font-display font-bold text-zinc-100 flex items-center gap-2">
+                  <Images className="w-5 h-5 text-indigo-500" />
+                  Your Gallery
+                </h2>
+                <button 
+                  onClick={() => setShowGallery(false)}
+                  className="p-2 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-xl transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              
+              <div className="flex-1 overflow-y-auto p-6 min-h-0">
+                {savedEdits.length === 0 ? (
+                  <div className="h-full flex flex-col items-center justify-center text-zinc-500 space-y-4">
+                    <Images className="w-12 h-12 opacity-20" />
+                    <p>No saved edits yet. Start creating!</p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+                    {savedEdits.map((edit) => (
+                      <div key={edit.id} className="group relative aspect-square rounded-xl overflow-hidden bg-zinc-950 border border-zinc-800">
+                        <img src={edit.imageUrl} alt={edit.prompt} className="w-full h-full object-cover" />
+                        <div className="absolute inset-0 bg-zinc-950/80 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center gap-2 p-4">
+                          <p className="text-xs text-zinc-300 text-center line-clamp-2 mb-2">{edit.prompt}</p>
+                          <div className="flex gap-2">
+                            <button 
+                              onClick={async () => {
+                                try {
+                                  setStatus('Loading...');
+                                  const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(edit.imageUrl)}`;
+                                  const response = await fetch(proxyUrl);
+                                  if (!response.ok) throw new Error('Failed to fetch from proxy');
+                                  const blob = await response.blob();
+                                  const reader = new FileReader();
+                                  reader.onloadend = () => {
+                                    const dataUrl = reader.result as string;
+                                    const img = new Image();
+                                    img.onload = () => {
+                                      setImage(img);
+                                      resizeCanvas(img);
+                                      clearMask();
+                                      setStatus('Loaded from Gallery');
+                                      setImageHistory({ past: [], present: dataUrl, future: [] });
+                                      setShowGallery(false);
+                                    };
+                                    img.src = dataUrl;
+                                  };
+                                  reader.readAsDataURL(blob);
+                                } catch (error) {
+                                  console.error("Error loading image for edit:", error);
+                                  setStatus('Error loading image');
+                                }
+                              }}
+                              className="p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors"
+                              title="Edit Again"
+                            >
+                              <PenTool className="w-4 h-4" />
+                            </button>
+                            <a 
+                              href={edit.imageUrl}
+                              download={`ai-edit-${edit.id}.png`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="p-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded-lg transition-colors"
+                              title="Download"
+                            >
+                              <Download className="w-4 h-4" />
+                            </a>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* API Key Selection Overlay */}
+      <AnimatePresence>
+        {!hasApiKey && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 z-[200] flex items-center justify-center p-4 bg-zinc-950/90 backdrop-blur-xl rounded-2xl md:rounded-3xl"
+          >
+            <div className="bg-zinc-900 border border-zinc-800 p-8 rounded-3xl max-w-md w-full text-center space-y-6 shadow-2xl">
+              <div className="w-16 h-16 bg-indigo-500/10 rounded-2xl flex items-center justify-center mx-auto border border-indigo-500/20">
+                <Sparkles className="w-8 h-8 text-indigo-500" />
+              </div>
+              <div className="space-y-2">
+                <h2 className="text-2xl font-display font-bold text-zinc-100">High-Quality Generation</h2>
+                <p className="text-sm text-zinc-400 leading-relaxed">
+                  To use the Nano Banana 2 model for 4K image generation, you need to select a paid Google Cloud API key.
+                </p>
+              </div>
+              <div className="pt-4 space-y-4">
+                <button
+                  onClick={handleSelectKey}
+                  className="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold transition-all shadow-lg shadow-indigo-500/20"
+                >
+                  Select API Key
+                </button>
+                <p className="text-xs text-zinc-500">
+                  Need a key? Check the <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:underline">billing documentation</a>.
+                </p>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
